@@ -1,5 +1,6 @@
 python
 
+#
 # GDB dashboard - Modular visual interface for GDB in Python.
 #
 # https://github.com/cyrus-and/gdb-dashboard
@@ -37,17 +38,13 @@ The list of all the available styles can be obtained with (from GDB itself):
             # values formatting
             'compact_values': {
                 'doc': 'Display complex objects in a single line.',
-                'default': True,
+                'default': False,
                 'type': bool
             },
             'max_value_length': {
                 'doc': 'Maximum length for displayed values.',
-                'default': 100,
+                'default': 0,
                 'type': int
-            },
-            'value_truncation_string': {
-                'doc': 'String to use to denote value truncation.',
-                'default': '…',
             },
             'dereference': {
                 'doc': 'Annotate pointers with the pointed value.',
@@ -96,7 +93,7 @@ which `{pid}` is expanded with the process identifier of the target program.''',
             },
             'divider_label_style_on_secondary': {
                 'doc': 'Label style for non-empty secondary dividers',
-                'default': '1;37'
+                'default': '0'
             },
             'divider_label_style_off_primary': {
                 'doc': 'Label style for empty primary dividers',
@@ -138,9 +135,6 @@ which `{pid}` is expanded with the process identifier of the target program.''',
             },
             'style_error': {
                 'default': '31'
-            },
-            'style_critical': {
-                'default': '0;41'
             }
         }
 
@@ -234,54 +228,8 @@ def format_value(value, compact=None):
         out = re.sub(r'$\s*', '', out, flags=re.MULTILINE)
     # truncate the value
     if R.max_value_length > 0 and len(out) > R.max_value_length:
-        out = out[0:R.max_value_length] + ansi(R.value_truncation_string, R.style_critical)
+        out = out[0:R.max_value_length] + ansi('[...]', R.style_error)
     return out
-
-# XXX parsing the output of `info breakpoints` is apparently the best option
-# right now, see: https://sourceware.org/bugzilla/show_bug.cgi?id=18385
-def fetch_breakpoints(watchpoints=False, pending=False):
-    # fetch breakpoints addresses
-    addresses = dict()
-    for line in run('info breakpoints').split('\n'):
-        # just keep numbered lines
-        if not line or not line[0].isdigit():
-            continue
-        # extract breakpoint number and address (if regular non-pending breakpoint)
-        try:
-            fields = line.split()
-            number = int(fields[0], 16)
-            address = int(fields[4], 16) if len(fields) >= 5 and fields[1] == 'breakpoint' else None
-        except ValueError:
-            continue
-        addresses[number] = address
-    # fetch breakpoints from the API and complement with address and source
-    # information
-    breakpoints = []
-    for gdb_breakpoint in gdb.breakpoints():
-        if not pending and gdb_breakpoint.pending:
-            continue
-        if not watchpoints and gdb_breakpoint.type != gdb.BP_BREAKPOINT:
-            continue
-        # add useful fields to the object
-        breakpoint = dict()
-        breakpoint['number'] = gdb_breakpoint.number
-        breakpoint['type'] = gdb_breakpoint.type
-        breakpoint['enabled'] = gdb_breakpoint.enabled
-        breakpoint['location'] = gdb_breakpoint.location
-        breakpoint['expression'] = gdb_breakpoint.expression
-        breakpoint['condition'] = gdb_breakpoint.condition
-        breakpoint['temporary'] = gdb_breakpoint.temporary
-        breakpoint['hit_count'] = gdb_breakpoint.hit_count
-        breakpoint['pending'] = gdb_breakpoint.pending
-        # add address and source information
-        address = addresses.get(gdb_breakpoint.number)
-        if address:
-            sal = gdb.find_pc_line(address)
-            breakpoint['address'] = address
-            breakpoint['file_name'] = sal.symtab.filename if sal.symtab else None
-            breakpoint['file_line'] = sal.line
-        breakpoints.append(breakpoint)
-    return breakpoints
 
 class Beautifier():
     def __init__(self, hint, tab_size=4):
@@ -364,6 +312,8 @@ class Dashboard(gdb.Command):
             try:
                 with open(output, 'w') as fs:
                     fs.write(Dashboard.reset_terminal())
+                    fs.write(Dashboard.clear_screen())
+                    fs.write('--- EXITED ---')
             except:
                 # skip cleanup for invalid outputs
                 pass
@@ -436,13 +386,13 @@ class Dashboard(gdb.Command):
         # process each display info
         for output, instances in display_map.items():
             try:
-                buf = ''
-                # use GDB stream by default
                 fs = None
+                # use GDB stream by default
                 if output:
                     fs = open(output, 'w')
                     fd = fs.fileno()
-                    fs.write(Dashboard.setup_terminal())
+                    # setup the terminal
+                    fs.write(Dashboard.hide_cursor())
                 else:
                     fs = gdb
                     fd = 1  # stdout
@@ -455,12 +405,11 @@ class Dashboard(gdb.Command):
                 # clear the "screen" if requested for the main terminal,
                 # auxiliary terminals are always cleared
                 if fs is not gdb or clear_screen:
-                    buf += Dashboard.clear_screen()
+                    fs.write(Dashboard.clear_screen())
                 # show message in separate terminals if all the modules are
                 # disabled
                 if output != self.output and not any(instances):
-                    buf += '--- NO MODULE TO DISPLAY ---\n'
-                    fs.write(buf)
+                    fs.write('--- NO MODULE TO DISPLAY ---\n')
                     continue
                 # process all the modules for that output
                 for n, instance in enumerate(instances, 1):
@@ -477,17 +426,17 @@ class Dashboard(gdb.Command):
                     # create the divider accordingly
                     div = divider(width, instance.label(), True, lines)
                     # write the data
-                    buf += '\n'.join([div] + lines)
+                    fs.write('\n'.join([div] + lines))
                     # write the newline for all but last unless main terminal
                     if n != len(instances) or fs is gdb:
-                        buf += '\n'
+                        fs.write('\n')
                 # write the final newline and the terminator only if it is the
                 # main terminal to allow the prompt to display correctly (unless
                 # there are no modules to display)
                 if fs is gdb and not all_disabled:
-                    buf += divider(width, primary=True)
-                    buf += '\n'
-                fs.write(buf)
+                    fs.write(divider(width, primary=True))
+                    fs.write('\n')
+                fs.flush()
             except Exception as e:
                 cause = traceback.format_exc().strip()
                 Dashboard.err('Cannot write the dashboard\n{}'.format(cause))
@@ -600,14 +549,14 @@ class Dashboard(gdb.Command):
         return '\x1b[H\x1b[J'
 
     @staticmethod
-    def setup_terminal():
-        # ANSI: enable alternative screen buffer and hide cursor
-        return '\x1b[?1049h\x1b[?25l'
+    def hide_cursor():
+        # ANSI: hide cursor
+        return '\x1b[?25l'
 
     @staticmethod
     def reset_terminal():
-        # ANSI: disable alternative screen buffer and show cursor
-        return '\x1b[?1049l\x1b[?25h'
+        # ANSI: reset to initial state
+        return '\x1bc'
 
 # Module descriptor ------------------------------------------------------------
 
@@ -770,7 +719,8 @@ command.'''
             if self.obj.output:
                 try:
                     with open(self.obj.output, 'w') as fs:
-                        fs.write(Dashboard.reset_terminal())
+                        fs.write(Dashboard.clear_screen())
+                        fs.write('--- RELEASED ---\n')
                 except:
                     # just do nothing if the file is not writable
                     pass
@@ -983,7 +933,7 @@ class Source(Dashboard.Module):
         if current_line == 0:
             return []
         # reload the source file if changed
-        file_name = sal.symtab.filename
+        file_name = sal.symtab.fullname()
         ts = None
         try:
             ts = os.path.getmtime(file_name)
@@ -1020,8 +970,6 @@ class Source(Dashboard.Module):
             end = len(self.source_lines)
         else:
             end = max(end, 0)
-        # find the breakpoints for teh current file
-        breakpoints = list(filter(lambda x: x.get('file_name') == file_name, fetch_breakpoints()))
         # return the source code listing
         out = []
         number_format = '{{:>{}}}'.format(len(str(end)))
@@ -1031,25 +979,17 @@ class Source(Dashboard.Module):
             if int(number) == current_line:
                 # the current line has a different style without ANSI
                 if R.ansi:
-                    if self.highlighted:
-                        line_format = '{}' + ansi(number_format, R.style_selected_1) + '  {}'
+                    if self.highlighted and not self.highlight_line:
+                        line_format = ansi(number_format,
+                                           R.style_selected_1) + ' {}'
                     else:
-                        line_format = '{}' + ansi(number_format + '  {}', R.style_selected_1)
+                        line_format = ansi(number_format + ' {}', R.style_selected_1)
                 else:
                     # just show a plain text indicator
-                    line_format = '{}' + number_format + '> {}'
+                    line_format = number_format + '>{}'
             else:
-                line_format = '{}' + ansi(number_format, R.style_low) + '  {}'
-            # check for breakpoint presence
-            enabled = None
-            for breakpoint in breakpoints:
-                if breakpoint['file_line'] == number:
-                    enabled = enabled or breakpoint['enabled']
-            if enabled is None:
-                breakpoint = ' '
-            else:
-                breakpoint = ansi('!', R.style_critical) if enabled else ansi('-', R.style_low)
-            out.append(line_format.format(breakpoint, number, line.rstrip('\n')))
+                line_format = ansi(number_format, R.style_low) + ' {}'
+            out.append(line_format.format(number, line.rstrip('\n')))
         # return the output along with scroll indicators
         if len(out) <= height:
             extra = [ansi('~', R.style_low)]
@@ -1085,6 +1025,12 @@ class Source(Dashboard.Module):
                 'name': 'tab_size',
                 'type': int,
                 'check': check_gt_zero
+            },
+            'highlight-line': {
+                'doc': 'Decide whether the whole current line should be highlighted.',
+                'default': True,
+                'name': 'highlight_line',
+                'type': bool
             }
         }
 
@@ -1094,8 +1040,6 @@ instructions constituting the current statement are marked, if available.'''
 
     def __init__(self):
         self.offset = 0
-        self.cache_key = None
-        self.cache_asm = None
 
     def label(self):
         return 'Assembly'
@@ -1104,31 +1048,22 @@ instructions constituting the current statement are marked, if available.'''
         # skip if the current thread is not stopped
         if not gdb.selected_thread().is_stopped():
             return []
-        # flush the cache if the style is changed
-        if style_changed:
-            self.cache_key = None
-        # prepare the highlighter
-        try:
-            flavor = gdb.parameter('disassembly-flavor')
-        except:
-            flavor = 'att'  # not always defined (see #36)
-        highlighter = Beautifier(flavor)
-        # fetch the assembly code
         line_info = None
         frame = gdb.selected_frame()  # PC is here
+        disassemble = frame.architecture().disassemble
         height = self.height or (term_height - 1)
         try:
-            # disassemble the current block (if function information is
-            # available then try to obtain the boundaries by looking at the
-            # superblocks)
-            block = frame.block()
+            # disassemble the current block (using function information if
+            # possible)
             if frame.function():
-                while block and (not block.function or block.function.name != frame.function().name):
-                    block = block.superblock
-                block = block or frame.block()
-            asm_start = block.start
-            asm_end = block.end - 1
-            asm = self.fetch_asm(asm_start, asm_end, False, highlighter)
+                block = frame.function().symtab.global_block()
+                asm_start = to_unsigned(frame.function().value())
+                asm_end = block.end - 1
+            else:
+                block =  gdb.block_for_pc(frame.pc())
+                asm_start = block.start
+                asm_end = block.end - 1
+            asm = disassemble(asm_start, end_pc=asm_end)
             # find the location of the PC
             pc_index = next(index for index, instr in enumerate(asm)
                             if instr['addr'] == frame.pc())
@@ -1159,7 +1094,7 @@ instructions constituting the current statement are marked, if available.'''
             try:
                 extra_start = 0
                 extra_end = 0
-                asm = self.fetch_asm(frame.pc(), height, True, highlighter)
+                asm = disassemble(frame.pc(), count=height)
             except gdb.error as e:
                 msg = '{}'.format(e)
                 return [ansi(msg, R.style_error)]
@@ -1167,12 +1102,18 @@ instructions constituting the current statement are marked, if available.'''
         func_start = None
         if self.show_function and frame.function():
             func_start = to_unsigned(frame.function().value())
+        # fetch the assembly flavor and use it as hint for Pygments
+        try:
+            flavor = gdb.parameter('disassembly-flavor')
+        except:
+            flavor = 'att'  # not always defined (see #36)
+        # prepare the highlighter
+        highlighter = Beautifier(flavor)
         # compute the maximum offset size
         if asm and func_start:
             max_offset = max(len(str(abs(asm[0]['addr'] - func_start))),
                              len(str(abs(asm[-1]['addr'] - func_start))))
         # return the machine code
-        breakpoints = fetch_breakpoints()
         max_length = max(instr['length'] for instr in asm) if asm else 0
         inferior = gdb.selected_inferior()
         out = []
@@ -1185,7 +1126,7 @@ instructions constituting the current statement are marked, if available.'''
                 # fetch and format opcode
                 region = inferior.read_memory(addr, length)
                 opcodes = (' '.join('{:02x}'.format(ord(byte)) for byte in region))
-                opcodes += (max_length - len(region)) * 3 * ' ' + '  '
+                opcodes += (max_length - len(region)) * 3 * ' ' + ' '
             else:
                 opcodes = ''
             # compute the offset if available
@@ -1198,63 +1139,37 @@ instructions constituting the current statement are marked, if available.'''
                     func_info = '?'
             else:
                 func_info = ''
-            format_string = '{}{}{}{}{}{}'
-            indicator = '  '
-            text = ' ' + text
+            format_string = '{}{}{}{}{}'
+            indicator = ' '
+            text = ' ' + highlighter.process(text)
             if addr == frame.pc():
                 if not R.ansi:
-                    indicator = '> '
+                    indicator = '>'
                 addr_str = ansi(addr_str, R.style_selected_1)
                 indicator = ansi(indicator, R.style_selected_1)
                 opcodes = ansi(opcodes, R.style_selected_1)
                 func_info = ansi(func_info, R.style_selected_1)
-                if not highlighter.active:
+                if not highlighter.active or self.highlight_line:
                     text = ansi(text, R.style_selected_1)
             elif line_info and line_info.pc <= addr < line_info.last:
                 if not R.ansi:
-                    indicator = ': '
+                    indicator = ':'
                 addr_str = ansi(addr_str, R.style_selected_2)
                 indicator = ansi(indicator, R.style_selected_2)
                 opcodes = ansi(opcodes, R.style_selected_2)
                 func_info = ansi(func_info, R.style_selected_2)
-                if not highlighter.active:
+                if not highlighter.active or self.highlight_line:
                     text = ansi(text, R.style_selected_2)
             else:
                 addr_str = ansi(addr_str, R.style_low)
                 func_info = ansi(func_info, R.style_low)
-            # check for breakpoint presence
-            enabled = None
-            for breakpoint in breakpoints:
-                if breakpoint.get('address') == addr:
-                    enabled = enabled or breakpoint['enabled']
-            if enabled is None:
-                breakpoint = ' '
-            else:
-                breakpoint = ansi('!', R.style_critical) if enabled else ansi('-', R.style_low)
-            out.append(format_string.format(breakpoint, addr_str, indicator, opcodes, func_info, text))
+            out.append(format_string.format(addr_str, indicator, opcodes, func_info, text))
         # return the output along with scroll indicators
         if len(out) <= height:
             extra = [ansi('~', R.style_low)]
             return extra_start * extra + out + extra_end * extra
         else:
             return out
-
-    def fetch_asm(self, start, end_or_count, relative, highlighter):
-        # fetch asm from cache or disassemble
-        if self.cache_key == (start, end_or_count):
-            asm = self.cache_asm
-        else:
-            kwargs = {
-                'start_pc': start,
-                'count' if relative else 'end_pc': end_or_count
-            }
-            asm = gdb.selected_frame().architecture().disassemble(**kwargs)
-            self.cache_key = (start, end_or_count)
-            self.cache_asm = asm
-            # syntax highlight the cached entry
-            for instr in asm:
-                instr['asm'] = highlighter.process(instr['asm'])
-        return asm
 
     def scroll(self, arg):
         if arg:
@@ -1289,6 +1204,12 @@ instructions constituting the current statement are marked, if available.'''
                 'default': True,
                 'name': 'show_function',
                 'type': bool
+            },
+            'highlight-line': {
+                'doc': 'Decide whether the whole current line should be highlighted.',
+                'default': True,
+                'name': 'highlight_line',
+                'type': bool
             }
         }
 
@@ -1318,7 +1239,7 @@ class Variables(Dashboard.Module):
             },
             'compact': {
                 'doc': 'Single-line display flag.',
-                'default': True,
+                'default': False,
                 'type': bool
             }
         }
@@ -1502,8 +1423,8 @@ class Memory(Dashboard.Module):
     '''Allow to inspect memory regions.'''
 
     class Region():
-        def __init__(self, expression, length, module):
-            self.expression = expression
+        def __init__(self, address, length, module):
+            self.address = address
             self.length = length
             self.module = module
             self.original = None
@@ -1512,15 +1433,14 @@ class Memory(Dashboard.Module):
         def format(self):
             # fetch the memory content
             try:
-                address = Memory.parse_as_address(self.expression)
                 inferior = gdb.selected_inferior()
-                memory = inferior.read_memory(address, self.length)
+                memory = inferior.read_memory(self.address, self.length)
                 # set the original memory snapshot if needed
                 if not self.original:
                     self.original = memory
-            except gdb.error as e:
-                msg = 'Cannot access {} bytes starting at {}: {}'
-                msg = msg.format(self.length, self.expression, e)
+            except gdb.error:
+                msg = 'Cannot access {} bytes starting at {}'
+                msg = msg.format(self.length, format_address(self.address))
                 return [ansi(msg, R.style_error)]
 
             # format the memory content
@@ -1528,7 +1448,7 @@ class Memory(Dashboard.Module):
             for i in range(0, len(memory), self.module.row_length):
                 region = memory[i:i + self.module.row_length]
                 pad = self.module.row_length - len(region)
-                address_str = format_address(address + i)
+                address = format_address(self.address + i)
                 # compute changes
                 hexa = []
                 text = []
@@ -1548,8 +1468,8 @@ class Memory(Dashboard.Module):
                     hexa.append(hexa_byte)
                     text.append(text_byte)
                 # output the formatted line
-                out.append('{}  {}{}  {}{}'.format(
-                    ansi(address_str, R.style_low),
+                out.append('{} {}{} {}{}'.format(
+                    ansi(address, R.style_low),
                     ' '.join(hexa), ansi(pad * ' --', R.style_low),
                     ''.join(text), ansi(pad * '.', R.style_low)))
             # update the latest memory snapshot
@@ -1580,30 +1500,34 @@ class Memory(Dashboard.Module):
 
     def lines(self, term_width, term_height, style_changed):
         out = []
-        for expression, region in self.table.items():
-            out.append(divider(term_width, expression))
+        for address, region in sorted(self.table.items()):
             out.extend(region.format())
+            out.append(divider(term_width))
+        # drop last divider
+        if out:
+            del out[-1]
         return out
 
     def watch(self, arg):
         if arg:
-            expression, _, length = arg.partition(' ')
+            address, _, length = arg.partition(' ')
+            address = Memory.parse_as_address(address)
             if length:
                 length = Memory.parse_as_address(length)
             else:
                 length = self.row_length
-            self.table[expression] = Memory.Region(expression, length, self)
+            self.table[address] = Memory.Region(address, length, self)
         else:
-            raise Exception('Specify a memory location')
+            raise Exception('Specify an address')
 
     def unwatch(self, arg):
         if arg:
             try:
-                del self.table[arg]
+                del self.table[Memory.parse_as_address(arg)]
             except KeyError:
-                raise Exception('Memory expression not watched')
+                raise Exception('Memory region not watched')
         else:
-            raise Exception('Specify a matched memory expression')
+            raise Exception('Specify an address')
 
     def clear(self, arg):
         self.table.clear()
@@ -1612,13 +1536,13 @@ class Memory(Dashboard.Module):
         return {
             'watch': {
                 'action': self.watch,
-                'doc': 'Watch a memory region by expression and length.\n'
+                'doc': 'Watch a memory region by address and length.\n'
                        'The length defaults to 16 byte.',
                 'complete': gdb.COMPLETE_EXPRESSION
             },
             'unwatch': {
                 'action': self.unwatch,
-                'doc': 'Stop watching a memory region by expression.',
+                'doc': 'Stop watching a memory region by address.',
                 'complete': gdb.COMPLETE_EXPRESSION
             },
             'clear': {
@@ -1657,6 +1581,7 @@ class Registers(Dashboard.Module):
         else:
             register_list = list(map(lambda line: line.split(None, 1)[0],
                                      run('info registers').strip().split('\n')))
+
         # fetch registers status
         registers = []
         for name in register_list:
@@ -1668,44 +1593,34 @@ class Registers(Dashboard.Module):
             changed = self.table and (self.table.get(name, '') != string_value)
             self.table[name] = string_value
             registers.append((name, string_value, changed))
-        # compute lengths considering an extra space between and around the
-        # entries (hence the +2 and term_width - 1)
+        # split registers in rows and columns, each column is composed of name,
+        # space, value and another trailing space which is skipped in the last
+        # column (hence term_width + 1)
         max_name = max(len(name) for name, _, _ in registers)
         max_value = max(len(value) for _, value, _ in registers)
         max_width = max_name + max_value + 2
-        columns = min(int((term_width - 1) / max_width) or 1, len(registers))
-        rows = int(math.ceil(float(len(registers)) / columns))
-        # build the registers matrix
+        per_line = min(int((term_width + 1) / max_width) or 1, len(registers))
+        # redistribute extra space among columns
+        extra = int((term_width + 1 - max_width * per_line) / per_line)
+        max_name += int(extra / 2)
+        # format registers info
+        partial = []
+        for name, value, changed in registers:
+            styled_name = ansi(name.rjust(max_name), R.style_low)
+            value_style = R.style_selected_1 if changed else ''
+            styled_value = ansi(value.ljust(max_value), value_style)
+            partial.append(styled_name + ' ' + styled_value)
+        out = []
         if self.column_major:
-            matrix = list(registers[i:i + rows] for i in range(0, len(registers), rows))
+            num_lines = int(math.ceil(float(len(partial)) / per_line))
+            for i in range(num_lines):
+                line = ' '.join(partial[i:len(partial):num_lines]).rstrip()
+                real_n_col = math.ceil(float(len(partial)) / num_lines)
+                line = ' ' * int((per_line - real_n_col) * max_width / 2) + line
+                out.append(line)
         else:
-            matrix = list(registers[i::columns] for i in range(columns))
-        # compute the lengths column wise
-        max_names_column = list(max(len(name) for name, _, _ in column) for column in matrix)
-        max_values_column = list(max(len(value) for _, value, _ in column) for column in matrix)
-        line_length = sum(max_names_column) + columns + sum(max_values_column)
-        extra = term_width - line_length
-        # compute padding as if there were one more column
-        base_padding = int(extra / (columns + 1))
-        padding_column = [base_padding] * columns
-        # distribute the remainder among columns giving the precedence to
-        # internal padding
-        rest = extra % (columns + 1)
-        while rest:
-            padding_column[rest % columns] += 1
-            rest -= 1
-        # format the registers
-        out = [''] * rows
-        for i, column in enumerate(matrix):
-            max_name = max_names_column[i]
-            max_value = max_values_column[i]
-            for j, (name, value, changed) in enumerate(column):
-                name = ' ' * (max_name - len(name)) + ansi(name, R.style_low)
-                style = R.style_selected_1 if changed else ''
-                value = ansi(value, style) + ' ' * (max_value - len(value))
-                padding = ' ' * padding_column[i]
-                item = '{}{} {}'.format(padding, name, value)
-                out[j] += item
+            for i in range(0, len(partial), per_line):
+                out.append(' '.join(partial[i:i + per_line]).rstrip())
         return out
 
     def attributes(self):
@@ -1803,46 +1718,40 @@ class Expressions(Dashboard.Module):
     '''Watch user expressions.'''
 
     def __init__(self):
-        self.table = set()
+        self.number = 1
+        self.table = {}
 
     def label(self):
         return 'Expressions'
 
     def lines(self, term_width, term_height, style_changed):
         out = []
-        default_radix = gdb.parameter('output-radix')
-        for expression in self.table:
-            label = expression
-            match = re.match('^/(\d+) +(.+)$', expression)
+        for number, expression in sorted(self.table.items()):
             try:
-                if match:
-                    radix, expression = match.groups()
-                    run('set output-radix {}'.format(radix))
                 value = format_value(gdb.parse_and_eval(expression))
             except gdb.error as e:
                 value = ansi(e, R.style_error)
-            finally:
-                if match:
-                    run('set output-radix {}'.format(default_radix))
-            expression = ansi(label, R.style_high)
+            number = ansi(number, R.style_selected_2)
+            expression = ansi(expression, R.style_high)
             equal = ansi('=', R.style_low)
-            out.append('{} {} {}'.format(expression, equal, value))
+            out.append('[{}] {} {} {}'.format(number, expression, equal, value))
         return out
 
     def watch(self, arg):
         if arg:
-            self.table.add(arg)
+            self.table[self.number] = arg
+            self.number += 1
         else:
             raise Exception('Specify an expression')
 
     def unwatch(self, arg):
         if arg:
             try:
-                self.table.remove(arg)
+                del self.table[int(arg)]
             except:
                 raise Exception('Expression not watched')
         else:
-            raise Exception('Specify an expression')
+            raise Exception('Specify an identifier')
 
     def clear(self, arg):
         self.table.clear()
@@ -1851,84 +1760,17 @@ class Expressions(Dashboard.Module):
         return {
             'watch': {
                 'action': self.watch,
-                'doc': 'Watch an expression using the format `[/<radix>] <expression>`.',
+                'doc': 'Watch an expression.',
                 'complete': gdb.COMPLETE_EXPRESSION
             },
             'unwatch': {
                 'action': self.unwatch,
-                'doc': 'Stop watching an expression.',
+                'doc': 'Stop watching an expression by id.',
                 'complete': gdb.COMPLETE_EXPRESSION
             },
             'clear': {
                 'action': self.clear,
                 'doc': 'Clear all the watched expressions.'
-            }
-        }
-
-class Breakpoints(Dashboard.Module):
-    '''Display the breakpoints list.'''
-
-    Names = {
-        gdb.BP_BREAKPOINT: 'break',
-        gdb.BP_WATCHPOINT: 'watch',
-        gdb.BP_HARDWARE_WATCHPOINT: 'write watch',
-        gdb.BP_READ_WATCHPOINT: 'read watch',
-        gdb.BP_ACCESS_WATCHPOINT: 'access watch'
-    }
-
-    def label(self):
-        return 'Breakpoints'
-
-    def lines(self, term_width, term_height, style_changed):
-        out = []
-        breakpoints = fetch_breakpoints(watchpoints=True, pending=self.show_pending)
-        for breakpoint in breakpoints:
-            # format common information
-            style = R.style_selected_1 if breakpoint['enabled'] else R.style_selected_2
-            number = ansi(breakpoint['number'], style)
-            bp_type = ansi(Breakpoints.Names[breakpoint['type']], style)
-            if breakpoint['temporary']:
-                bp_type = bp_type + ' {}'.format(ansi('once', style))
-            if not R.ansi and breakpoint['enabled']:
-                bp_type = 'disabled ' + bp_type
-            line = '[{}] {}'.format(number, bp_type)
-            if breakpoint['type'] == gdb.BP_BREAKPOINT:
-                # format memory address
-                address = breakpoint.get('address')
-                if address:
-                    line += ' at {}'.format(ansi(format_address(address), style))
-                # format source information
-                file_name = breakpoint.get('file_name')
-                file_line = breakpoint.get('file_line')
-                if file_name and file_line:
-                    file_name = ansi(file_name, style)
-                    file_line = ansi(file_line, style)
-                    line += ' in {}:{}'.format(file_name, file_line)
-                # format user location
-                location = breakpoint['location']
-                line += ' for {}'.format(ansi(location, style))
-            else:
-                # format user expression
-                expression = breakpoint['expression']
-                line += ' for {}'.format(ansi(expression, style))
-            # format condition
-            condition = breakpoint['condition']
-            if condition:
-                line += ' if {}'.format(ansi(condition, style))
-            # format hit count
-            hit_count = breakpoint['hit_count']
-            if hit_count:
-                line += ' hit {} times'.format(ansi(breakpoint['hit_count'], style))
-            out.append(line)
-        return out
-
-    def attributes(self):
-        return {
-            'pending': {
-                'doc': 'Also show pending breakpoints.',
-                'default': True,
-                'name': 'show_pending',
-                'type': bool
             }
         }
 
@@ -1973,3 +1815,17 @@ python Dashboard.start()
 # Local Variables:
 # mode: python
 # End:
+
+dashboard -layout registers stack assembly source history
+dashboard source -style height 30
+dashboard history -style limit 10
+dashboard -style syntax_highlighting 'rrt'
+dashboard -style style_selected_1 100
+
+# Redraw on stack changes
+define hookpost-up
+dashboard
+end
+define hookpost-down
+dashboard
+end
